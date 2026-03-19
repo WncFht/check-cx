@@ -6,6 +6,7 @@ import pLimit from "p-limit";
 import type { CheckResult, ProviderConfig } from "../types";
 import { getErrorMessage, getSanitizedErrorDetail, logError } from "../utils";
 import { checkWithAiSdk } from "./ai-sdk-check";
+import { buildRateLimitedResult, maybeApplyRateLimitCooldown } from "./rate-limit";
 import { getCheckConcurrency } from "../core/polling-config";
 
 // 最多尝试 3 次：初始一次 + 2 次重试
@@ -35,7 +36,7 @@ async function checkWithRetry(config: ProviderConfig): Promise<CheckResult> {
         );
         continue;
       }
-      return result;
+      return maybeApplyRateLimitCooldown(result);
     } catch (error) {
       const message = getErrorMessage(error);
       if (
@@ -51,7 +52,7 @@ async function checkWithRetry(config: ProviderConfig): Promise<CheckResult> {
       }
 
       logError(`检查 ${config.name} (${config.type}) 失败`, error);
-      return {
+      return maybeApplyRateLimitCooldown({
         id: config.id,
         name: config.name,
         type: config.type,
@@ -64,7 +65,7 @@ async function checkWithRetry(config: ProviderConfig): Promise<CheckResult> {
         message,
         logMessage: getSanitizedErrorDetail(error),
         groupName: config.groupName || null,
-      };
+      });
     }
   }
 
@@ -78,15 +79,31 @@ async function checkWithRetry(config: ProviderConfig): Promise<CheckResult> {
  * @returns 检查结果列表,按名称排序
  */
 export async function runProviderChecks(
-  configs: ProviderConfig[]
+  configs: ProviderConfig[],
+  options?: {
+    checker?: (config: ProviderConfig) => Promise<CheckResult>;
+    now?: () => number;
+  }
 ): Promise<CheckResult[]> {
   if (configs.length === 0) {
     return [];
   }
 
+  const checker = options?.checker ?? checkWithRetry;
+  const now = options?.now ?? Date.now;
   const limit = pLimit(getCheckConcurrency());
   const results = await Promise.all(
-    configs.map((config) => limit(() => checkWithRetry(config)))
+    configs.map((config) =>
+      limit(async () => {
+        const skipped = buildRateLimitedResult(config, now());
+        if (skipped) {
+          return skipped;
+        }
+
+        const result = await checker(config);
+        return maybeApplyRateLimitCooldown(result, now());
+      })
+    )
   );
 
   return results.sort((a, b) => a.name.localeCompare(b.name));

@@ -123,6 +123,7 @@ pnpm lint   # 代码检查
 
 - 架构说明：`docs/ARCHITECTURE.md`
 - 运维手册：`docs/OPERATIONS.md`
+- 本地运维：`docs/LOCAL_RUNBOOK.md`
 - Provider 扩展：`docs/EXTENDING_PROVIDERS.md`
 
 ## 许可证

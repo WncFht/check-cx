@@ -4,8 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "build": "next build --webpack",
+    "start": "node scripts/start-server.mjs",
+    "ctl": "node scripts/check-cxctl.mjs",
     "lint": "eslint"
   },
   "dependencies": {
