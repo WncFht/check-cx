@@ -4,6 +4,7 @@
 
 默认约定：
 
+- 默认监听：`0.0.0.0:24167`
 - 本地入口：`http://127.0.0.1:24167`
 - PID 文件：`/tmp/check-cx.pid`
 - 日志文件：`/tmp/check-cx.log`
@@ -44,14 +45,14 @@ pnpm ctl service start
 默认会：
 
 - 读取 `.env.local`
-- 以 `127.0.0.1:24167` 启动服务
+- 以 `0.0.0.0:24167` 启动服务
 - 将输出写到 `/tmp/check-cx.log`
 - 将 PID 写到 `/tmp/check-cx.pid`
 
 如需覆盖端口：
 
 ```bash
-pnpm ctl service start --port 3000 --host 127.0.0.1
+pnpm ctl service start --port 3000 --host 0.0.0.0
 ```
 
 ### 查看状态

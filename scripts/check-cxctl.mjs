@@ -11,12 +11,13 @@ import {getStartPlan} from "./start-server.mjs";
 
 const DEFAULT_GROUP = "cch";
 const DEFAULT_PORT = 24167;
-const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PID_FILE = "/tmp/check-cx.pid";
 const DEFAULT_LOG_FILE = "/tmp/check-cx.log";
 const DEFAULT_CCH_API_URL = "http://127.0.0.1:23000";
 const DEFAULT_CCH_ENV_PATH = "/Users/fanghaotian/Applications/claude-code-hub/.env";
 const PROXY_HELPER = "/Users/fanghaotian/.config/shell/proxy.sh";
+const LOCAL_PROBE_HOST = "127.0.0.1";
 const MODEL_PREFERENCES = {
   codex: ["gpt-5.4", "gpt-5", "gpt-5.3-codex", "gpt-5.2-codex"],
   "openai-compatible": ["gpt-5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2"],
@@ -169,6 +170,102 @@ function findListeningPid(port) {
   return Number.isFinite(pid) && pid > 0 ? pid : null;
 }
 
+export function parseListenAddress(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  if (raw.startsWith("[")) {
+    const boundary = raw.lastIndexOf("]:");
+    if (boundary < 0) {
+      return null;
+    }
+    const host = raw.slice(1, boundary);
+    const port = Number(raw.slice(boundary + 2));
+    return Number.isFinite(port) ? {host, port} : null;
+  }
+
+  const boundary = raw.lastIndexOf(":");
+  if (boundary < 0) {
+    return null;
+  }
+
+  const host = raw.slice(0, boundary);
+  const port = Number(raw.slice(boundary + 1));
+  return Number.isFinite(port) ? {host, port} : null;
+}
+
+function isWildcardListenHost(host) {
+  return host === "*" || host === "0.0.0.0" || host === "::";
+}
+
+function findProcessListener(pid) {
+  if (!pid) {
+    return null;
+  }
+
+  const result = spawnSync("lsof", ["-nP", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-Ffn"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  if (result.status !== 0) {
+    return null;
+  }
+
+  const line = result.stdout
+    .split(/\r?\n/)
+    .find((entry) => entry.startsWith("n"));
+
+  return line ? parseListenAddress(line.slice(1)) : null;
+}
+
+export function applyActiveRuntime(runtime, current, flags = {}) {
+  const next = {
+    host: runtime.host,
+    port: runtime.port,
+  };
+
+  if (current?.listenPort && flags.port === undefined) {
+    next.port = current.listenPort;
+  }
+
+  if (current?.listenHost && flags.host === undefined && !isWildcardListenHost(current.listenHost)) {
+    next.host = current.listenHost;
+  }
+
+  if (flags.host === undefined && isWildcardListenHost(current?.listenHost || next.host)) {
+    next.host = LOCAL_PROBE_HOST;
+  }
+
+  return next;
+}
+
+export function applyBindingRuntime(runtime, current, flags = {}) {
+  const next = {
+    host: runtime.host,
+    port: runtime.port,
+  };
+
+  if (current?.listenPort && flags.port === undefined) {
+    next.port = current.listenPort;
+  }
+
+  if (current?.listenHost && flags.host === undefined) {
+    next.host = isWildcardListenHost(current.listenHost) ? runtime.host : current.listenHost;
+  }
+
+  return next;
+}
+
+export function formatBaseUrl(host, port) {
+  const normalizedHost = String(host || "");
+  const formattedHost =
+    normalizedHost.includes(":") && !normalizedHost.startsWith("[") ? `[${normalizedHost}]` : normalizedHost;
+  return `http://${formattedHost}:${port}`;
+}
+
 export function resolveServicePid({pidFromFile, isPidRunning, listenerPid}) {
   if (pidFromFile && isPidRunning) {
     return {pid: pidFromFile, source: "pid-file"};
@@ -183,18 +280,31 @@ export function resolveServicePid({pidFromFile, isPidRunning, listenerPid}) {
 
 function getServiceProcess(runtime) {
   const pidFromFile = readPid(runtime.pidFile);
+  const isPidRunning = isProcessRunning(pidFromFile);
+  const pidListener = isPidRunning ? findProcessListener(pidFromFile) : null;
   const listenerPid = findListeningPid(runtime.port);
   const resolved = resolveServicePid({
     pidFromFile,
-    isPidRunning: isProcessRunning(pidFromFile),
+    isPidRunning,
     listenerPid,
   });
+
+  const listener =
+    resolved.pid === pidFromFile && pidListener
+      ? pidListener
+      : resolved.pid
+        ? findProcessListener(resolved.pid)
+        : null;
 
   if (resolved.pid !== pidFromFile) {
     syncPidFile(runtime.pidFile, resolved.pid);
   }
 
-  return resolved;
+  return {
+    ...resolved,
+    listenHost: listener?.host ?? null,
+    listenPort: listener?.port ?? null,
+  };
 }
 
 function delay(ms) {
@@ -205,7 +315,8 @@ function delay(ms) {
 
 async function waitForServiceReady(runtime, startedPid) {
   const deadline = Date.now() + 10_000;
-  const baseUrl = `http://${runtime.host}:${runtime.port}`;
+  const probeRuntime = applyActiveRuntime(runtime, null, {});
+  const baseUrl = formatBaseUrl(probeRuntime.host, probeRuntime.port);
   let lastError = null;
 
   while (Date.now() < deadline) {
@@ -237,6 +348,21 @@ async function waitForServiceReady(runtime, startedPid) {
 
   const message = lastError instanceof Error ? `: ${lastError.message}` : "";
   throw new Error(`服务启动失败，请查看日志 ${runtime.logFile}${message}`);
+}
+
+function getRuntimeContext(projectDir, flags) {
+  const runtime = getRuntimeOptions(projectDir, flags);
+  const current = getServiceProcess(runtime);
+  const bindingRuntime = applyBindingRuntime(runtime, current, flags);
+  const activeRuntime = applyActiveRuntime(runtime, current, flags);
+
+  return {
+    runtime,
+    current,
+    bindingRuntime,
+    activeRuntime,
+    baseUrl: formatBaseUrl(activeRuntime.host, activeRuntime.port),
+  };
 }
 
 async function waitForServiceStop(runtime, pid) {
@@ -341,7 +467,7 @@ export function mapCchProviderToCheckConfig(provider, {groupName = DEFAULT_GROUP
   const baseUrl = normalizeProviderUrl(provider.url);
   const endpoint =
     provider.providerType === "openai-compatible"
-      ? `${baseUrl}/chat/completions`
+      ? `${baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`}/chat/completions`
       : `${baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`}/responses`;
 
   return {
@@ -485,9 +611,7 @@ async function upsertProviderConfig(supabase, config, {patchOnly = false} = {}) 
 }
 
 async function commandService(action, flags, projectDir) {
-  const runtime = getRuntimeOptions(projectDir, flags);
-  const baseUrl = `http://${runtime.host}:${runtime.port}`;
-  const current = getServiceProcess(runtime);
+  const {runtime, current, bindingRuntime, baseUrl} = getRuntimeContext(projectDir, flags);
 
   if (action === "start") {
     if (current.pid) {
@@ -501,7 +625,12 @@ async function commandService(action, flags, projectDir) {
       return;
     }
 
-    const plan = getServiceStartPlan(projectDir, flags);
+    const startFlags = {
+      ...flags,
+      host: flags.host === undefined ? bindingRuntime.host : flags.host,
+      port: flags.port === undefined ? String(bindingRuntime.port) : flags.port,
+    };
+    const plan = getServiceStartPlan(projectDir, startFlags);
     const outFd = openSync(runtime.logFile, "a");
     const child = spawn(plan.command, plan.args, {
       cwd: plan.cwd,
@@ -530,8 +659,13 @@ async function commandService(action, flags, projectDir) {
   }
 
   if (action === "restart") {
-    await commandService("stop", flags, projectDir);
-    await commandService("start", flags, projectDir);
+    const restartFlags = {
+      ...flags,
+      host: flags.host === undefined ? bindingRuntime.host : flags.host,
+      port: flags.port === undefined ? String(bindingRuntime.port) : flags.port,
+    };
+    await commandService("stop", restartFlags, projectDir);
+    await commandService("start", restartFlags, projectDir);
     return;
   }
 
@@ -655,9 +789,9 @@ async function commandProviders(action, flags, projectDir) {
   }
 
   if (action === "refresh") {
-    const runtime = getRuntimeOptions(projectDir, flags);
+    const {baseUrl} = getRuntimeContext(projectDir, flags);
     const response = await fetch(
-      `http://${runtime.host}:${runtime.port}/api/group/${encodeURIComponent(groupName)}?trendPeriod=7d&forceRefresh=1`
+      `${baseUrl}/api/group/${encodeURIComponent(groupName)}?trendPeriod=7d&forceRefresh=1`
     );
     const payload = await response.json();
     console.log(
@@ -699,7 +833,7 @@ async function commandUpdate(flags, projectDir) {
 
 function printHelp() {
   console.log(`Usage:
-  node scripts/check-cxctl.mjs service <start|stop|restart|status|logs> [--port 24167] [--host 127.0.0.1]
+  node scripts/check-cxctl.mjs service <start|stop|restart|status|logs> [--port 24167] [--host 0.0.0.0]
   node scripts/check-cxctl.mjs build
   node scripts/check-cxctl.mjs update
   node scripts/check-cxctl.mjs providers <list|sync-cch|upsert|set|enable|disable|refresh> [--group cch]
