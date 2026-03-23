@@ -126,14 +126,15 @@ lib/
 
 ### 配置管理
 
-配置已从环境变量迁移到 Supabase 数据库的 `check_configs` 表:
+配置已从环境变量迁移到 Supabase 数据库的 `check_models` / `check_configs` / `check_request_templates` 三层结构:
 
-- **配置加载**: `lib/database/config-loader.ts:loadProviderConfigsFromDB()` 从数据库读取已启用的配置
+- **配置加载**: `lib/database/config-loader.ts:loadProviderConfigsFromDB()` 从数据库读取已启用的配置，并关联模型与模板
 - **动态启用/禁用**: 通过更新数据库 `enabled` 字段即可控制检测任务，无需重启应用
 - **维护模式**: 设置 `is_maintenance = true` 保留卡片但停止轮询，显示维护状态
 - **分组管理**: 通过 `group_name` 字段对配置进行分组，支持分组视图和详情页
-- **自定义请求头**: 通过配置 `request_header` 字段自定义多个请求头（JSON 格式），可绕过特定的 API 请求限制
-- **自定义请求参数**: 通过配置 `metadata` 字段（JSONB）自定义请求体参数，会合并到 API 请求中
+- **模型复用**: 通过 `check_models` 统一维护模型名与模板绑定，`check_configs` 使用 `model_id` 关联
+- **默认请求参数**: `request_header` 和 `metadata` 只保存在 `check_request_templates`
+- **链路关系**: `check_configs` → `check_models` → `check_request_templates`
 - **类型安全**: 使用 `lib/types/database.ts` 中定义的 `CheckConfigRow` 类型
 
 ### 健康检查流程
@@ -191,19 +192,27 @@ lib/
 ### 数据库表结构
 
 ```sql
+-- 模型表
+check_models (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  type TEXT NOT NULL,  -- 'openai' | 'gemini' | 'anthropic'
+  model TEXT NOT NULL,
+  template_id UUID REFERENCES check_request_templates(id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+)
+
 -- 配置表
 check_configs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL,
   type TEXT NOT NULL,  -- 'openai' | 'gemini' | 'anthropic'
-  model TEXT NOT NULL,
+  model_id UUID NOT NULL REFERENCES check_models(id),
   endpoint TEXT NOT NULL,
   api_key TEXT NOT NULL,
   enabled BOOLEAN DEFAULT true,
   is_maintenance BOOLEAN DEFAULT false,  -- 维护模式
   group_name TEXT,  -- 分组名称
-  request_header JSONB,  -- 自定义请求头
-  metadata JSONB,  -- 自定义请求参数
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
 )
@@ -341,48 +350,40 @@ export async function check新Provider(
 不要通过环境变量管理 CHECK 配置,请使用 SQL 命令在 Supabase 中操作:
 
 ```sql
+-- 先创建或复用模板
+INSERT INTO check_request_templates (name, type, request_header, metadata)
+VALUES (
+  'openai-default',
+  'openai',
+  '{"User-Agent": "check-cx"}',
+  '{"temperature": 0}'
+)
+ON CONFLICT (name) DO NOTHING;
+
+-- 再创建或复用模型，并把模板绑到模型上
+INSERT INTO check_models (type, model, template_id)
+SELECT 'openai', 'gpt-4o-mini', id
+FROM check_request_templates
+WHERE name = 'openai-default'
+ON CONFLICT (type, model) DO NOTHING;
+
 -- 添加配置
-INSERT INTO check_configs (name, type, model, endpoint, api_key, enabled)
-VALUES ('主力 OpenAI', 'openai', 'gpt-4o-mini',
-        'https://api.openai.com/v1/chat/completions',
-        'sk-xxx', true);
+INSERT INTO check_configs (name, type, model_id, endpoint, api_key, enabled)
+SELECT '主力 OpenAI', 'openai', id,
+       'https://api.openai.com/v1/chat/completions',
+       'sk-xxx', true
+FROM check_models
+WHERE type = 'openai' AND model = 'gpt-4o-mini';
 
--- 添加配置并设置自定义请求头（JSON 格式）
-INSERT INTO check_configs (name, type, model, endpoint, api_key, enabled, request_header)
-VALUES ('自定义请求头配置', 'openai', 'gpt-4o-mini',
-        'https://api.example.com/v1/chat/completions',
-        'sk-xxx', true,
-        '{"User-Agent": "claude-cli/1.0.111 (external, cli)", "X-Custom-Header": "some-value"}');
-
--- 添加配置并设置自定义请求参数（metadata）
-INSERT INTO check_configs (name, type, model, endpoint, api_key, enabled, metadata)
-VALUES ('自定义参数配置', 'openai', 'gpt-4o-mini',
-        'https://api.example.com/v1/chat/completions',
-        'sk-xxx', true,
-        '{"temperature": 0.5, "max_tokens": 50}');
-
--- 同时设置请求头和 metadata
-INSERT INTO check_configs (name, type, model, endpoint, api_key, enabled, request_header, metadata)
-VALUES ('完整自定义配置', 'openai', 'gpt-4o-mini',
-        'https://api.example.com/v1/chat/completions',
-        'sk-xxx', true,
-        '{"User-Agent": "custom-agent/1.0", "X-Request-Id": "check-cx"}',
-        '{"temperature": 0.7}');
-
--- 更新已有配置的请求头
-UPDATE check_configs
-SET request_header = '{"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}'
-WHERE name = '主力 OpenAI';
-
--- 更新已有配置的 metadata
-UPDATE check_configs
-SET metadata = '{"max_tokens": 100}'
-WHERE name = '主力 OpenAI';
-
--- 清除自定义请求头(恢复使用默认值)
-UPDATE check_configs
-SET request_header = NULL
-WHERE name = '主力 OpenAI';
+-- 更新模型绑定的模板
+UPDATE check_models
+SET template_id = (
+  SELECT id
+  FROM check_request_templates
+  WHERE name = 'openai-default'
+)
+WHERE type = 'openai'
+  AND model = 'gpt-4o-mini';
 
 -- 禁用配置
 UPDATE check_configs SET enabled = false WHERE name = '主力 OpenAI';

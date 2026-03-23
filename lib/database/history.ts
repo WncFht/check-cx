@@ -49,6 +49,15 @@ interface RpcHistoryRow {
   group_name: string | null;
 }
 
+interface JoinedConfigRow {
+  id: string;
+  name: string;
+  type: string;
+  endpoint: string;
+  group_name: string | null;
+  check_models?: { model: string } | Array<{ model: string }> | null;
+}
+
 /**
  * SnapshotStore 负责与数据库交互，提供统一的读/写/清理接口
  */
@@ -228,9 +237,11 @@ async function fallbackFetchSnapshot(
           id,
           name,
           type,
-          model,
           endpoint,
-          group_name
+          group_name,
+          check_models (
+            model
+          )
         )
       `
       )
@@ -252,14 +263,17 @@ async function fallbackFetchSnapshot(
       if (!configs || !Array.isArray(configs) || configs.length === 0) {
         continue;
       }
-      const config = configs[0];
+      const config = configs[0] as JoinedConfigRow;
+      const model = Array.isArray(config.check_models)
+        ? (config.check_models[0]?.model ?? "")
+        : (config.check_models?.model ?? "");
 
       const result: CheckResult = {
         id: config.id,
         name: config.name,
-        type: config.type,
+        type: config.type as CheckResult["type"],
         endpoint: config.endpoint,
-        model: config.model,
+        model,
         status: record.status as CheckResult["status"],
         latencyMs: record.latency_ms,
         pingLatencyMs: record.ping_latency_ms ?? null,
@@ -315,4 +329,3 @@ async function fallbackPruneHistory(
     logError("fallback 模式下清理历史异常", error);
   }
 }
-

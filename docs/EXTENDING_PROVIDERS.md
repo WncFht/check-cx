@@ -30,7 +30,7 @@
 
 1. 在 `createModel` 中新增 `case`，返回 AI SDK 模型实例。
 2. 选择合适的 Provider SDK（如 `@ai-sdk/openai-compatible`）。
-3. 如需自定义请求头与请求体参数，使用已有的 `request_header` 与 `metadata` 机制。
+3. 如需自定义请求头与请求体参数，放到 `check_request_templates`，再由 `check_models.template_id` 绑定。
 
 示例结构（仅示意）：
 
@@ -63,9 +63,32 @@ case "myvendor": {
 新增 Provider 后，插入配置：
 
 ```sql
-INSERT INTO check_configs (name, type, model, endpoint, api_key, enabled)
-VALUES ('MyVendor 主力', 'myvendor', 'my-model', 'https://api.myvendor.com/v1/chat/completions', 'sk-xxx', true);
+-- 1) 注册模板
+INSERT INTO check_request_templates (name, type)
+VALUES ('myvendor-default', 'myvendor')
+ON CONFLICT (name) DO NOTHING;
+
+-- 2) 注册模型
+INSERT INTO check_models (type, model, template_id)
+SELECT 'myvendor', 'my-model', id
+FROM check_request_templates
+WHERE name = 'myvendor-default'
+ON CONFLICT (type, model) DO NOTHING;
+
+-- 3) 绑定到配置实例
+INSERT INTO check_configs (name, type, model_id, endpoint, api_key, enabled)
+SELECT 'MyVendor 主力',
+       'myvendor',
+       id,
+       'https://api.myvendor.com/v1/chat/completions',
+       'sk-xxx',
+       true
+FROM check_models
+WHERE type = 'myvendor'
+  AND model = 'my-model';
 ```
+
+如果同一模型需要统一默认参数，请更新 `check_request_templates.request_header` / `check_request_templates.metadata`，再把模板绑定到 `check_models.template_id`。
 
 ## 5. 验证清单
 
@@ -73,4 +96,3 @@ VALUES ('MyVendor 主力', 'myvendor', 'my-model', 'https://api.myvendor.com/v1/
 - Dashboard 卡片可见并显示延迟
 - 官方状态（若已实现）显示正确
 - 状态 API `GET /api/v1/status` 返回新 Provider
-

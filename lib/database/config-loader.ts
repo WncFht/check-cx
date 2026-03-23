@@ -6,7 +6,7 @@ import "server-only";
 import {createAdminClient} from "../supabase/admin";
 import {getPollingIntervalMs} from "../core/polling-config";
 import type {CheckConfigRow, ProviderConfig, ProviderType} from "../types";
-import type {CheckRequestTemplateRow} from "../types/database";
+import type {CheckModelRow, CheckRequestTemplateRow} from "../types/database";
 import {logError} from "../utils";
 
 interface ConfigCache {
@@ -21,11 +21,14 @@ interface ConfigCacheMetrics {
 
 type JsonRecord = Record<string, unknown>;
 type TemplateProjection = Pick<CheckRequestTemplateRow, "type" | "request_header" | "metadata">;
-type ConfigRowWithTemplate = Pick<
-  CheckConfigRow,
-  "id" | "name" | "type" | "model" | "endpoint" | "api_key" | "is_maintenance" | "template_id" | "request_header" | "metadata" | "group_name"
-> & {
+type ModelProjection = Pick<CheckModelRow, "id" | "type" | "model" | "template_id"> & {
   check_request_templates?: TemplateProjection | TemplateProjection[] | null;
+};
+type ConfigRowWithModel = Pick<
+  CheckConfigRow,
+  "id" | "name" | "type" | "model_id" | "endpoint" | "api_key" | "is_maintenance" | "group_name"
+> & {
+  check_models?: ModelProjection | ModelProjection[] | null;
 };
 
 const cache: ConfigCache = {
@@ -54,24 +57,23 @@ function normalizeJsonRecord(value: unknown): JsonRecord | null {
   return value as JsonRecord;
 }
 
-function mergeTemplateAndConfig(templateValue: unknown, configValue: unknown): JsonRecord | null {
-  const templateRecord = normalizeJsonRecord(templateValue);
-  const configRecord = normalizeJsonRecord(configValue);
+function getModel(row: ConfigRowWithModel): ModelProjection | null {
+  const model = Array.isArray(row.check_models)
+    ? row.check_models[0]
+    : row.check_models;
 
-  if (!templateRecord && !configRecord) {
+  if (!model || model.type !== row.type) {
     return null;
   }
 
-  return {
-    ...(templateRecord ?? {}),
-    ...(configRecord ?? {}),
-  };
+  return model;
 }
 
-function getTemplate(row: ConfigRowWithTemplate): TemplateProjection | null {
-  const template = Array.isArray(row.check_request_templates)
-    ? row.check_request_templates[0]
-    : row.check_request_templates;
+function getTemplateFromModel(row: ConfigRowWithModel): TemplateProjection | null {
+  const model = getModel(row);
+  const template = Array.isArray(model?.check_request_templates)
+    ? model.check_request_templates[0]
+    : model?.check_request_templates;
 
   if (!template || template.type !== row.type) {
     return null;
@@ -100,7 +102,7 @@ export async function loadProviderConfigsFromDB(options?: {
     const { data, error } = await supabase
       .from("check_configs")
       .select(
-        "id, name, type, model, endpoint, api_key, is_maintenance, template_id, request_header, metadata, group_name, check_request_templates(type, request_header, metadata)"
+        "id, name, type, model_id, endpoint, api_key, is_maintenance, group_name, check_models(id, type, model, template_id, check_request_templates(type, request_header, metadata))"
       )
       .eq("enabled", true)
       .order("id");
@@ -118,17 +120,18 @@ export async function loadProviderConfigsFromDB(options?: {
     }
 
     const configs: ProviderConfig[] = data.map(
-      (row: ConfigRowWithTemplate) => {
-        const template = getTemplate(row);
-        const mergedRequestHeaders = mergeTemplateAndConfig(template?.request_header, row.request_header) as Record<string, string> | null;
-        const mergedMetadata = mergeTemplateAndConfig(template?.metadata, row.metadata);
+      (row: ConfigRowWithModel) => {
+        const model = getModel(row);
+        const template = getTemplateFromModel(row);
+        const mergedRequestHeaders = normalizeJsonRecord(template?.request_header) as Record<string, string> | null;
+        const mergedMetadata = normalizeJsonRecord(template?.metadata);
 
         return {
           id: row.id,
           name: row.name,
           type: row.type as ProviderType,
           endpoint: row.endpoint,
-          model: row.model,
+          model: model?.model ?? "",
           apiKey: row.api_key,
           is_maintenance: row.is_maintenance,
           requestHeaders: mergedRequestHeaders,

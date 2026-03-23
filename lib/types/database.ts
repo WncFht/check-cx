@@ -1,7 +1,19 @@
 /**
  * 数据库表类型定义
- * 对应 Supabase 的 check_configs 和 check_history 表
+ * 对应 Supabase 的模型、配置与历史表
  */
+
+/**
+ * check_models 表的行类型
+ */
+export interface CheckModelRow {
+  id: string;
+  type: string;
+  model: string;
+  template_id?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
 
 /**
  * check_configs 表的行类型
@@ -10,16 +22,14 @@ export interface CheckConfigRow {
   id: string;
   name: string;
   type: string;
-  model: string;
+  model_id: string;
   endpoint: string;
   api_key: string;
   enabled: boolean;
   is_maintenance: boolean;
-  template_id?: string | null;
-  request_header?: Record<string, string> | null;
-  metadata?: Record<string, unknown> | null;
   group_name?: string | null;
   created_at?: string;
+  updated_at?: string;
 }
 
 /**
