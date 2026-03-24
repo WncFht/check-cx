@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import {openSync, readFileSync, writeFileSync, existsSync, unlinkSync} from "node:fs";
-import {resolve} from "node:path";
+import {homedir} from "node:os";
+import {join, resolve} from "node:path";
 import {spawn, spawnSync} from "node:child_process";
 import process from "node:process";
 import {fileURLToPath} from "node:url";
@@ -15,13 +16,26 @@ const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PID_FILE = "/tmp/check-cx.pid";
 const DEFAULT_LOG_FILE = "/tmp/check-cx.log";
 const DEFAULT_CCH_API_URL = "http://127.0.0.1:23000";
-const DEFAULT_CCH_ENV_PATH = "/Users/fanghaotian/Applications/claude-code-hub/.env";
-const PROXY_HELPER = "/Users/fanghaotian/.config/shell/proxy.sh";
 const LOCAL_PROBE_HOST = "127.0.0.1";
 const MODEL_PREFERENCES = {
   codex: ["gpt-5.4", "gpt-5", "gpt-5.3-codex", "gpt-5.2-codex"],
   "openai-compatible": ["gpt-5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2"],
 };
+
+function resolveHomeDir(homePath) {
+  return String(homePath || process.env.HOME || homedir());
+}
+
+export function getDefaultCchEnvPath(homePath) {
+  return join(resolveHomeDir(homePath), "Applications", "claude-code-hub", ".env");
+}
+
+export function getDefaultProxyHelperPath(homePath) {
+  return join(resolveHomeDir(homePath), ".config", "shell", "proxy.sh");
+}
+
+const DEFAULT_CCH_ENV_PATH = getDefaultCchEnvPath();
+const PROXY_HELPER = getDefaultProxyHelperPath();
 
 export function readEnvFile(filePath) {
   if (!existsSync(filePath)) {
@@ -156,18 +170,47 @@ function isProcessRunning(pid) {
   }
 }
 
+export function extractFirstPid(output) {
+  const candidate = String(output || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^\d+$/.test(line));
+
+  if (!candidate) {
+    return null;
+  }
+
+  const pid = Number(candidate);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+export function extractPidFromSsOutput(output) {
+  const match = String(output || "").match(/\bpid=(\d+)\b/);
+  if (!match) {
+    return null;
+  }
+
+  const pid = Number(match[1]);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
 function findListeningPid(port) {
   const result = spawnSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  if (result.status !== 0) {
-    return null;
+  const lsofPid = extractFirstPid(result.stdout);
+  if (lsofPid) {
+    return lsofPid;
   }
 
-  const pid = Number(result.stdout.trim().split(/\r?\n/)[0]);
-  return Number.isFinite(pid) && pid > 0 ? pid : null;
+  const ssResult = spawnSync("ss", ["-ltnp", `( sport = :${port} )`], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  return extractPidFromSsOutput(ssResult.stdout);
 }
 
 export function parseListenAddress(value) {
@@ -210,7 +253,7 @@ function findProcessListener(pid) {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  if (result.status !== 0) {
+  if (!result.stdout) {
     return null;
   }
 
@@ -452,6 +495,38 @@ export function normalizeProviderUrl(url) {
   return String(url || "").trim().replace(/\/+$/, "");
 }
 
+function getRelatedRow(row, key) {
+  const value = row?.[key];
+  return Array.isArray(value) ? value[0] || null : value || null;
+}
+
+export function normalizeProviderConfigRow(row) {
+  const {check_models, ...rest} = row;
+  const model = getRelatedRow({check_models}, "check_models")?.model ?? row?.model ?? "";
+  return {
+    ...rest,
+    model,
+  };
+}
+
+export function resolveProviderModelSelection(existing, flags) {
+  const nextType = flags.type !== undefined ? String(flags.type) : String(existing?.type || "");
+  const nextModel = flags.model !== undefined ? String(flags.model) : String(existing?.model || "");
+
+  if (!nextType) {
+    throw new Error("缺少 provider type");
+  }
+
+  if (!nextModel) {
+    throw new Error("缺少 provider model");
+  }
+
+  return {
+    type: nextType,
+    model: nextModel,
+  };
+}
+
 export function pickCheckModel(models, providerType) {
   const normalized = [...new Set((Array.isArray(models) ? models : []).map((item) => String(item || "").trim()).filter(Boolean))];
   const preferred = MODEL_PREFERENCES[providerType] || ["gpt-5.4", "gpt-5"];
@@ -479,9 +554,6 @@ export function mapCchProviderToCheckConfig(provider, {groupName = DEFAULT_GROUP
     enabled: true,
     is_maintenance: false,
     group_name: groupName,
-    request_header: null,
-    metadata: null,
-    template_id: null,
   };
 }
 
@@ -578,7 +650,41 @@ async function loadEnabledCchProviders(flags) {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
+async function ensureCheckModel(supabase, {type, model}) {
+  const {data, error} = await supabase
+    .from("check_models")
+    .upsert(
+      {
+        type: String(type),
+        model: String(model),
+      },
+      {onConflict: "type,model"}
+    )
+    .select("id")
+    .single();
+
+  if (error) {
+    throw error;
+  }
+
+  return data.id;
+}
+
 async function upsertProviderConfig(supabase, config, {patchOnly = false} = {}) {
+  const modelId = await ensureCheckModel(supabase, {
+    type: config.type,
+    model: config.model,
+  });
+  const dbConfig = {
+    name: config.name,
+    type: config.type,
+    model_id: modelId,
+    endpoint: config.endpoint,
+    api_key: config.api_key,
+    enabled: config.enabled,
+    is_maintenance: config.is_maintenance,
+    group_name: config.group_name,
+  };
   const {data: existing, error: selectError} = await supabase
     .from("check_configs")
     .select("id, name")
@@ -593,7 +699,7 @@ async function upsertProviderConfig(supabase, config, {patchOnly = false} = {}) 
   if (!existing) {
     const {data, error} = await supabase
       .from("check_configs")
-      .insert(config)
+      .insert(dbConfig)
       .select("id, name")
       .single();
     if (error) {
@@ -602,7 +708,7 @@ async function upsertProviderConfig(supabase, config, {patchOnly = false} = {}) 
     return {action: "inserted", id: data.id, name: data.name};
   }
 
-  const updatePayload = patchOnly ? config : {...config};
+  const updatePayload = patchOnly ? dbConfig : {...dbConfig};
   const {error} = await supabase.from("check_configs").update(updatePayload).eq("id", existing.id);
   if (error) {
     throw error;
@@ -708,13 +814,13 @@ async function commandProviders(action, flags, projectDir) {
   if (action === "list") {
     const {data, error} = await supabase
       .from("check_configs")
-      .select("name,type,model,endpoint,enabled,is_maintenance,group_name,updated_at")
+      .select("name,type,endpoint,enabled,is_maintenance,group_name,updated_at,check_models(model)")
       .eq("group_name", groupName)
       .order("name");
     if (error) {
       throw error;
     }
-    console.log(JSON.stringify(data, null, 2));
+    console.log(JSON.stringify((data || []).map((row) => normalizeProviderConfigRow(row)), null, 2));
     return;
   }
 
@@ -739,9 +845,6 @@ async function commandProviders(action, flags, projectDir) {
       enabled: parseBoolean(flags.enabled, true),
       is_maintenance: parseBoolean(flags.maintenance, false),
       group_name: groupName,
-      request_header: null,
-      metadata: null,
-      template_id: null,
     };
     const result = await upsertProviderConfig(supabase, config);
     console.log(JSON.stringify(result, null, 2));
@@ -751,8 +854,6 @@ async function commandProviders(action, flags, projectDir) {
   if (action === "set") {
     const name = ensureOption(flags, "name");
     const patch = {};
-    if (flags.type !== undefined) patch.type = String(flags.type);
-    if (flags.model !== undefined) patch.model = String(flags.model);
     if (flags.endpoint !== undefined) patch.endpoint = String(flags.endpoint);
     if (flags["api-key"] !== undefined) patch.api_key = String(flags["api-key"]);
     if (flags.enabled !== undefined) patch.enabled = parseBoolean(flags.enabled, true);
@@ -761,13 +862,18 @@ async function commandProviders(action, flags, projectDir) {
 
     const {data: existing, error: selectError} = await supabase
       .from("check_configs")
-      .select("id,name")
+      .select("id,name,type,group_name,check_models(model)")
       .eq("name", name)
       .eq("group_name", groupName)
       .maybeSingle();
     if (selectError) throw selectError;
     if (!existing) {
       throw new Error(`未找到 provider: ${name} (${groupName})`);
+    }
+    if (flags.type !== undefined || flags.model !== undefined) {
+      const nextModelSelection = resolveProviderModelSelection(normalizeProviderConfigRow(existing), flags);
+      patch.type = nextModelSelection.type;
+      patch.model_id = await ensureCheckModel(supabase, nextModelSelection);
     }
     const {error} = await supabase.from("check_configs").update(patch).eq("id", existing.id);
     if (error) throw error;

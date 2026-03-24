@@ -8,8 +8,10 @@ import {
   applyActiveRuntime,
   applyBindingRuntime,
   getServiceStartPlan,
+  normalizeProviderConfigRow,
   mapCchProviderToCheckConfig,
   pickCheckModel,
+  resolveProviderModelSelection,
   resolveServicePid,
 } from "../scripts/check-cxctl.mjs";
 
@@ -99,6 +101,75 @@ test("mapCchProviderToCheckConfig appends v1 for chat providers when the base ur
 
   assert.equal(mapped.model, "gpt-5");
   assert.equal(mapped.endpoint, "https://right.codes/codex/v1/chat/completions");
+});
+
+test("normalizeProviderConfigRow flattens check_models joins into the CLI payload", () => {
+  assert.deepEqual(
+    normalizeProviderConfigRow({
+      name: "RC",
+      type: "openai",
+      endpoint: "https://right.codes/codex/v1/responses",
+      enabled: true,
+      is_maintenance: false,
+      group_name: "cch",
+      updated_at: "2026-03-23T08:00:00.000Z",
+      check_models: [{model: "gpt-5.4"}],
+    }),
+    {
+      name: "RC",
+      type: "openai",
+      model: "gpt-5.4",
+      endpoint: "https://right.codes/codex/v1/responses",
+      enabled: true,
+      is_maintenance: false,
+      group_name: "cch",
+      updated_at: "2026-03-23T08:00:00.000Z",
+    }
+  );
+});
+
+test("resolveProviderModelSelection keeps existing values unless flags override them", () => {
+  assert.deepEqual(
+    resolveProviderModelSelection(
+      {
+        type: "openai",
+        model: "gpt-5.4",
+      },
+      {}
+    ),
+    {
+      type: "openai",
+      model: "gpt-5.4",
+    }
+  );
+
+  assert.deepEqual(
+    resolveProviderModelSelection(
+      {
+        type: "openai",
+        model: "gpt-5.4",
+      },
+      {model: "gpt-5"}
+    ),
+    {
+      type: "openai",
+      model: "gpt-5",
+    }
+  );
+
+  assert.deepEqual(
+    resolveProviderModelSelection(
+      {
+        type: "openai",
+        model: "gpt-5.4",
+      },
+      {type: "anthropic"}
+    ),
+    {
+      type: "anthropic",
+      model: "gpt-5.4",
+    }
+  );
 });
 
 test("getServiceStartPlan launches the standalone server directly instead of wrapping pnpm", () => {
